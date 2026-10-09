@@ -34,6 +34,14 @@ uv run bwsort categories --import   # store it
 uv run bwsort create-folders        # dry run
 uv run bwsort create-folders --apply
 
+# 7. Classification (stage 3) and review (stage 4): local DB only, vault untouched
+uv run bwsort classify --limit 40     # trial run
+uv run bwsort review --folder Unsorted
+uv run bwsort classify                # the rest
+uv run bwsort review                  # summary per folder
+uv run bwsort review --export data\plan.csv
+uv run bwsort review --import data\plan.csv
+
 # When finished
 bw lock
 ```

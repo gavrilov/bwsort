@@ -5,13 +5,18 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import asdict
+from enum import Enum
+from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from . import categories as cat
+from . import classify as clf
 from . import db
+from . import review as rv
 from .bw import BwClient, BwError
 from .config import ConfigError, Settings, load_settings
 from .llm import LlmError, OllamaClient
@@ -432,6 +437,140 @@ def create_folders(
         else:
             todo = sum(1 for _, fid in plan if not fid)
             console.print(f"Dry run: {todo} to create, {reused} already exist. Re-run with [bold]--apply[/].")
+    finally:
+        conn.close()
+
+class Confidence(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+
+
+@app.command()
+def classify(
+    limit: int | None = typer.Option(None, help="Classify at most N items (try a small run first)."),
+    min_confidence: Confidence = typer.Option(Confidence.medium, help="Below this the item goes to Unsorted."),
+    reclassify: bool = typer.Option(False, "--reclassify", help="Classify already planned items again (keeps your CSV edits)."),
+    think: bool = typer.Option(False, "--think", help="Let the model reason before answering (much slower)."),
+    account: str | None = typer.Option(None, help="Account id prefix, if the DB holds several accounts."),
+) -> None:
+    """Stage 3: pick a folder for every `new` item. Changes only the local DB, not the vault."""
+    s = _settings()
+    conn = _open_db(s)
+    try:
+        account_id = _pick_account(conn, account)
+        cats = cat.load_stored(conn, account_id)
+        if not cats:
+            console.print("[red]No stored categories.[/] Run `bwsort categories` and `--import` first.")
+            raise typer.Exit(1)
+        if cat.UNSORTED not in {c.name for c in cats}:
+            console.print(f"[red]The category list must contain {cat.UNSORTED!r}.[/] Fix categories.yaml and re-import.")
+            raise typer.Exit(1)
+        if reclassify:
+            n = db.reset_planned(conn, account_id)
+            console.print(f"{n} planned items reset to `new`.")
+
+        pending = len(db.items_with_status(conn, account_id, "new"))
+        total = min(pending, limit) if limit else pending
+        if total == 0:
+            console.print("Nothing to classify: no `new` items. Run `bwsort snapshot` to pick up new ones.")
+            return
+        if not any(c.examples for c in cats):
+            console.print("[yellow]Stored categories have no examples. Re-run `bwsort categories --import` to include them (better accuracy).[/]")
+        console.print(f"Classifying {total} items with {s.model}, batches of {s.batch_size}, min confidence: {min_confidence.value}.")
+
+        llm = OllamaClient(s.ollama_url, s.model)
+        run_id = db.start_run(conn, account_id, "classify", s.model)
+        try:
+            llm.ensure_model_is_local()
+            with Progress(
+                TextColumn("[bold]Classifying"), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(),
+                TextColumn("{task.fields[info]}"), console=console,
+            ) as progress:
+                task = progress.add_task("classify", total=total, info="")
+
+                def on_batch(done: int, _total: int, secs: float) -> None:
+                    progress.update(task, completed=done, info=f"LLM time {secs:.0f}s")
+
+                rep = clf.classify(
+                    conn, account_id, llm, cats,
+                    batch_size=s.batch_size, min_confidence=min_confidence.value,
+                    limit=limit, think=think, on_batch=on_batch,
+                )
+        except LlmError as exc:
+            console.print(f"[red]{exc}[/]\nProgress so far is saved; run `bwsort classify` again to continue.")
+            raise typer.Exit(1)
+        except KeyboardInterrupt:
+            console.print("[yellow]Interrupted. Finished batches are saved; run `bwsort classify` again to continue.[/]")
+            raise typer.Exit(130)
+        finally:
+            llm.close()
+
+        db.finish_run(conn, run_id, {k: v for k, v in rep.__dict__.items() if k != "errors"} | {"errors": len(rep.errors)})
+        console.print(
+            f"Done: {rep.by_llm} by the LLM ({rep.batches} requests, {rep.seconds:.0f}s), {rep.by_rule} by item type, "
+            f"{rep.low_confidence} low-confidence -> {cat.UNSORTED}, {rep.fallback} unanswered -> {cat.UNSORTED}."
+        )
+        if rep.errors:
+            console.print(f"[yellow]{len(rep.errors)} failed requests; those items stay `new` and will be retried. Last: {rep.errors[-1]}[/]")
+        _print_summary(conn, account_id)
+        console.print("\nNext: [bold]uv run bwsort review[/] to inspect, [bold]--export[/] / [bold]--import[/] a CSV to correct.")
+    finally:
+        conn.close()
+
+
+def _print_summary(conn, account_id: str) -> None:
+    rows = rv.summary(conn, account_id)
+    t = Table(title="Planned folders (nothing moved yet)")
+    for col, just in (("Folder", "left"), ("Items", "right"), ("High", "right"), ("Medium", "right"),
+                      ("By type", "right"), ("Your edits", "right"), ("Low -> Unsorted", "right"), ("Unanswered", "right")):
+        t.add_column(col, justify=just)
+    for r in rows:
+        t.add_row(r["category"] or "-", str(r["items"]), str(r["high"] or 0), str(r["medium"] or 0),
+                  str(r["by_rule"] or 0), str(r["by_user"] or 0), str(r["low_moved_to_unsorted"] or 0),
+                  str(r["unanswered"] or 0))
+    console.print(t)
+
+
+@app.command()
+def review(
+    folder: str | None = typer.Option(None, help="List the items planned for this folder."),
+    export: Path | None = typer.Option(None, "--export", help="Write all planned items to a CSV you can edit."),
+    import_: Path | None = typer.Option(None, "--import", help="Apply the edited `category` column of a CSV."),
+    account: str | None = typer.Option(None, help="Account id prefix, if the DB holds several accounts."),
+) -> None:
+    """Stage 4: inspect the plan and correct it. Changes only the local DB."""
+    s = _settings()
+    conn = _open_db(s)
+    try:
+        account_id = _pick_account(conn, account)
+        if export:
+            n = rv.export_csv(conn, account_id, export)
+            console.print(f"Wrote {n} items to [bold]{export}[/]. Edit the `category` column, then: bwsort review --import {export}")
+            return
+        if import_:
+            names = [c.name for c in cat.load_stored(conn, account_id)]
+            changed, errors = rv.import_csv(conn, account_id, import_, names)
+            for e in errors[:20]:
+                console.print(f"[yellow]{e}[/]")
+            if len(errors) > 20:
+                console.print(f"[yellow]... and {len(errors) - 20} more[/]")
+            console.print(f"[green]{changed} items updated.[/]")
+            _print_summary(conn, account_id)
+            return
+        if folder:
+            rows = rv.planned_items(conn, account_id, folder)
+            t = Table(title=f"{folder}: {len(rows)} items")
+            for col in ("Name", "Domains", "Old folder", "Confidence", "Source", "Model suggested"):
+                t.add_column(col)
+            for r in rows:
+                conf = "" if r["confidence"] is None else f"{r['confidence']:.1f}"
+                t.add_row(r["name"], " ".join(json.loads(r["domains"])), r["current_folder_name"] or "",
+                          conf, r["category_source"] or "", r["suggested_category"] or "")
+            console.print(t)
+            return
+        _print_summary(conn, account_id)
+        console.print("Use --folder NAME to list items, --export plan.csv to edit in Excel.")
     finally:
         conn.close()
 

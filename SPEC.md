@@ -47,11 +47,10 @@ Keyed by Bitwarden account (`userId` from `bw status`), so several accounts can 
 |---|---|
 | `accounts` | account id, server, first/last seen |
 | `runs` | every command run: command, model, start/finish, summary |
-| `items` | per item: metadata, current/original/target folder, status, category, confidence, source, timestamps, last error |
+| `items` | per item: metadata, current/original/target folder, status, category, model suggestion, confidence, source (rule/llm/fallback/user), timestamps, last error |
 | `folders` | known folders; `created_by_bwsort` marks the ones the tool created |
-| `categories` | the approved category list (= folder names) per account |
+| `categories` | the approved category list (= folder names) with descriptions and examples, per account |
 | `moves` | journal of every move (from -> to) for rollback |
-| `domain_cache` | domain -> category, to skip the LLM for known domains |
 
 Item status lifecycle:
 
@@ -74,8 +73,8 @@ Item status lifecycle:
 | — | `bwsort status` | item counts per status and recent runs | no |
 | 2 | `bwsort categories` | first run only: LLM gets an aggregated overview (domains with counts and 2 sample names, names of items without a website, old folders) and proposes 12-20 categories -> `data/categories.yaml`. Fixed categories are added by rule: `Payment Cards`, `Identities`, `SSH Keys` (only if such items exist) and `Unsorted`. You edit the file; `--import` validates it and stores it in the DB; `--show` prints the stored list; `--show-input` prints exactly what the LLM would get. Later runs reuse the stored list | no |
 | 2b | `bwsort create-folders [--apply]` | creates one Bitwarden folder per stored category; reuses an existing folder with the same name; marks them as bwsort folders in the DB. No item is moved | yes (folders only) |
-| 3 | `bwsort classify` | `new` items in batches of 20; schema with enum of categories and ids; domain cache; cards/identities/SSH keys by type without the LLM; low confidence -> `Unsorted` | no |
-| 4 | `bwsort review` | table of planned moves and per-folder summary; `--export plan.csv` / `--import plan.csv` for manual edits | no |
+| 3 | `bwsort classify [--limit N] [--min-confidence low/medium/high] [--reclassify] [--think]` | `new` items only. Cards/identities/SSH keys go to their fixed folder by type (no LLM). The rest is sorted by domain and sent in batches (`BWSORT_BATCH_SIZE`, default 20); the reply schema pins `id` to the batch ids and `category` to the stored names, confidence is high/medium/low. Below `--min-confidence` (default medium) -> `Unsorted`, model pick kept as `suggested_category`. Items the model skips get one retry, then `Unsorted` (source `fallback`). A failed request leaves its items `new`; 3 failures in a row abort. Every batch is committed, so an interrupted run resumes. `--reclassify` re-does planned items except your CSV edits | no |
+| 4 | `bwsort review [--folder NAME] [--export plan.csv] [--import plan.csv]` | per-folder summary (confidence, by type, your edits, low->Unsorted, unanswered); list one folder; export all planned items to CSV (Excel-friendly), edit the `category` column, import back (source `user`, never overwritten by `--reclassify`) | no |
 | 5 | `bwsort apply [--apply] [--delete-old-folders]` | backup, create folders, move (`bw get item` -> new `folderId` -> `bw encode \| bw edit item`), record in DB | yes |
 | 6 | `bwsort rollback [--run N]` | restore previous folders from the `moves` journal | yes |
 

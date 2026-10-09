@@ -25,7 +25,7 @@ from pathlib import Path
 
 from .sanitize import SafeItem
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 STATUSES = ("new", "planned", "failed", "moved", "manual", "skipped", "gone")
 
@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS categories (
     account_id   TEXT NOT NULL REFERENCES accounts(account_id),
     name         TEXT NOT NULL,                -- = folder name, English
     description  TEXT NOT NULL DEFAULT '',
+    examples     TEXT NOT NULL DEFAULT '[]',   -- JSON list (v2)
     position     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, name)
 );
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS items (
     original_folder_id TEXT,                   -- folder when first seen (for rollback)
     status             TEXT NOT NULL CHECK (status IN ('new','planned','failed','moved','manual','skipped','gone')),
     category           TEXT,
+    suggested_category TEXT,                   -- model's pick when confidence was too low (v2)
     confidence         REAL,
     category_source    TEXT,                   -- llm | rule | cache | user
     target_folder_id   TEXT,
@@ -97,13 +99,16 @@ CREATE TABLE IF NOT EXISTS moves (             -- journal for rollback
     at             TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS domain_cache (
-    account_id TEXT NOT NULL,
-    domain     TEXT NOT NULL,
-    category   TEXT NOT NULL,
-    PRIMARY KEY (account_id, domain)
-);
 """
+
+# Applied in order to databases created by an older version.
+_MIGRATIONS = {
+    2: [
+        "ALTER TABLE categories ADD COLUMN examples TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE items ADD COLUMN suggested_category TEXT",
+        "DROP TABLE IF EXISTS domain_cache",
+    ],
+}
 
 
 def now() -> str:
@@ -119,7 +124,12 @@ def connect(path: Path) -> sqlite3.Connection:
     if version > SCHEMA_VERSION:
         raise RuntimeError(f"{path} was created by a newer bwsort (schema {version})")
     with conn:
-        conn.executescript(_SCHEMA)
+        if version == 0:
+            conn.executescript(_SCHEMA)
+        else:
+            for target in range(version + 1, SCHEMA_VERSION + 1):
+                for stmt in _MIGRATIONS.get(target, []):
+                    conn.execute(stmt)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn
 
@@ -289,14 +299,31 @@ def items_with_status(conn: sqlite3.Connection, account_id: str, *statuses: str)
 
 
 def set_category(
-    conn: sqlite3.Connection, account_id: str, item_id: str, category: str, confidence: float | None, source: str
+    conn: sqlite3.Connection,
+    account_id: str,
+    item_id: str,
+    category: str,
+    confidence: float | None,
+    source: str,
+    suggested: str | None = None,
 ) -> None:
+    """Assign a category (status -> planned). Never touches moved/manual/skipped/gone items."""
     with conn:
         conn.execute(
-            """UPDATE items SET category=?, confidence=?, category_source=?, classified_at=?, status='planned'
+            """UPDATE items SET category=?, suggested_category=?, confidence=?, category_source=?,
+                                classified_at=?, status='planned'
                WHERE account_id=? AND item_id=? AND status IN ('new','planned','failed')""",
-            (category, confidence, source, now(), account_id, item_id),
+            (category, suggested, confidence, source, now(), account_id, item_id),
         )
+
+
+def reset_planned(conn: sqlite3.Connection, account_id: str, keep_user_edits: bool = True) -> int:
+    """Send planned items back to `new` so they get classified again."""
+    sql = "UPDATE items SET status='new', category=NULL, suggested_category=NULL, confidence=NULL, category_source=NULL WHERE account_id=? AND status='planned'"
+    if keep_user_edits:
+        sql += " AND COALESCE(category_source,'') != 'user'"
+    with conn:
+        return conn.execute(sql, (account_id,)).rowcount
 
 
 def register_bwsort_folder(conn: sqlite3.Connection, account_id: str, folder_id: str, name: str) -> None:

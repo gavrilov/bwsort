@@ -277,16 +277,22 @@ def store(conn: sqlite3.Connection, account_id: str, categories: list[Category])
     with conn:
         conn.execute("DELETE FROM categories WHERE account_id=?", (account_id,))
         conn.executemany(
-            "INSERT INTO categories(account_id, name, description, position) VALUES (?,?,?,?)",
-            [(account_id, c.name, c.description, i) for i, c in enumerate(categories)],
+            "INSERT INTO categories(account_id, name, description, examples, position) VALUES (?,?,?,?,?)",
+            [
+                (account_id, c.name, c.description, json.dumps(c.examples, ensure_ascii=False), i)
+                for i, c in enumerate(categories)
+            ],
         )
 
 
 def load_stored(conn: sqlite3.Connection, account_id: str) -> list[Category]:
     rows = conn.execute(
-        "SELECT name, description FROM categories WHERE account_id=? ORDER BY position", (account_id,)
+        "SELECT name, description, examples FROM categories WHERE account_id=? ORDER BY position", (account_id,)
     ).fetchall()
-    return [Category(r["name"], r["description"], fixed=r["name"] in RESERVED) for r in rows]
+    return [
+        Category(r["name"], r["description"], json.loads(r["examples"] or "[]"), fixed=r["name"] in RESERVED)
+        for r in rows
+    ]
 
 
 def folder_plan(categories: list[Category], live_folders: list[dict]) -> list[tuple[Category, str | None]]:

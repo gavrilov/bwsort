@@ -71,10 +71,13 @@ class OllamaClient:
             "options": options,
         }
         t0 = time.perf_counter()
-        r = self._http.post("/api/chat", json=payload)
-        if r.status_code == 400 and "think" in r.text.lower():
-            payload.pop("think")  # model without thinking support
+        try:
             r = self._http.post("/api/chat", json=payload)
+            if r.status_code == 400 and "think" in r.text.lower():
+                payload.pop("think")  # model without thinking support
+                r = self._http.post("/api/chat", json=payload)
+        except httpx.HTTPError as exc:
+            raise LlmError(f"Ollama request failed: {type(exc).__name__}: {exc}") from exc
         if r.status_code != 200:
             raise LlmError(f"Ollama /api/chat returned {r.status_code}: {r.text[:300]}")
         content = r.json().get("message", {}).get("content", "")
