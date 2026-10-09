@@ -42,6 +42,13 @@ uv run bwsort review                  # summary per folder
 uv run bwsort review --export data\plan.csv
 uv run bwsort review --import data\plan.csv
 
+# 8. Move (stage 5) - changes the vault
+uv run bwsort apply                          # dry run
+uv run bwsort apply --apply --limit 2        # backup + 2 items, check them in Bitwarden
+uv run bwsort apply --apply                  # the rest
+uv run bwsort apply --apply --delete-old-folders
+uv run bwsort rollback                       # dry run of undoing the last apply run
+
 # When finished
 bw lock
 ```

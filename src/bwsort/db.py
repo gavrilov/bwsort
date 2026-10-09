@@ -335,9 +335,24 @@ def register_bwsort_folder(conn: sqlite3.Connection, account_id: str, folder_id:
         )
 
 
+def bwsort_folder_map(conn: sqlite3.Connection, account_id: str) -> dict[str, str]:
+    """Category/folder name -> folder id, for folders created or adopted by bwsort."""
+    rows = conn.execute(
+        "SELECT name, folder_id FROM folders WHERE account_id=? AND created_by_bwsort=1", (account_id,)
+    )
+    return {r["name"]: r["folder_id"] for r in rows}
+
+
 def mark_moved(
-    conn: sqlite3.Connection, run_id: int, account_id: str, item_id: str, from_folder: str | None, to_folder: str
+    conn: sqlite3.Connection,
+    run_id: int,
+    account_id: str,
+    item_id: str,
+    from_folder: str | None,
+    to_folder: str,
+    journal: bool = True,
 ) -> None:
+    """Item is now in its target folder. journal=False when it was already there (nothing to roll back)."""
     ts = now()
     with conn:
         conn.execute(
@@ -345,10 +360,38 @@ def mark_moved(
                WHERE account_id=? AND item_id=?""",
             (to_folder, to_folder, ts, account_id, item_id),
         )
+        if journal:
+            conn.execute(
+                "INSERT INTO moves(run_id, account_id, item_id, from_folder_id, to_folder_id, at) VALUES (?,?,?,?,?,?)",
+                (run_id, account_id, item_id, from_folder, to_folder, ts),
+            )
+
+
+def mark_rolled_back(
+    conn: sqlite3.Connection, run_id: int, account_id: str, item_id: str, from_folder: str | None, to_folder: str | None
+) -> None:
+    """Item went back to its old folder: status planned again (category kept), so `apply` can redo it."""
+    ts = now()
+    with conn:
+        conn.execute(
+            """UPDATE items SET status='planned', target_folder_id=NULL, current_folder_id=?, moved_at=NULL
+               WHERE account_id=? AND item_id=?""",
+            (to_folder, account_id, item_id),
+        )
         conn.execute(
             "INSERT INTO moves(run_id, account_id, item_id, from_folder_id, to_folder_id, at) VALUES (?,?,?,?,?,?)",
             (run_id, account_id, item_id, from_folder, to_folder, ts),
         )
+
+
+def last_run_with_moves(conn: sqlite3.Connection, account_id: str, command: str = "apply") -> int | None:
+    row = conn.execute(
+        """SELECT r.run_id FROM runs r
+           WHERE r.account_id=? AND r.command=? AND EXISTS (SELECT 1 FROM moves m WHERE m.run_id = r.run_id)
+           ORDER BY r.run_id DESC LIMIT 1""",
+        (account_id, command),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def mark_failed(conn: sqlite3.Connection, account_id: str, item_id: str, error: str) -> None:

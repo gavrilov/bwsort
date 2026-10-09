@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from .sanitize import SafeItem, to_safe_item
@@ -81,7 +82,37 @@ class BwClient:
         folder = json.loads(self._run("create", "folder", encoded))
         return {"id": folder.get("id"), "name": folder.get("name")}
 
+    def delete_folder(self, folder_id: str) -> None:
+        self._run("delete", "folder", folder_id)
+
+    def export_encrypted(self, path: Path) -> None:
+        """Account-key encrypted JSON export (importable only into this account).
+
+        Runs attached to the terminal, without --nointeraction, because newer CLI
+        versions ask for the master password here. Nothing is captured or logged.
+        """
+        env = os.environ.copy()
+        env.pop("BW_SESSION", None)
+        if self._session:
+            env["BW_SESSION"] = self._session
+        path.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            [self.bin, "export", "--format", "encrypted_json", "--output", str(path)], env=env, check=False
+        )
+        if proc.returncode != 0:
+            raise BwError(f"`bw export` failed (exit code {proc.returncode})")
+
     # --- items --------------------------------------------------------------
+    # get_item_raw / edit_item_raw return FULL decrypted items (with secrets).
+    # Only apply.py may call them; never log, print or persist their results.
+
+    def get_item_raw(self, item_id: str) -> dict[str, Any]:
+        return json.loads(self._run("get", "item", item_id))
+
+    def edit_item_raw(self, item_id: str, item: dict[str, Any]) -> dict[str, Any]:
+        # Encoded JSON goes through stdin, not argv, so secrets never appear in the process list.
+        encoded = base64.b64encode(json.dumps(item).encode("utf-8")).decode("ascii")
+        return json.loads(self._run("edit", "item", item_id, stdin=encoded))
 
     def list_safe_items(self) -> list[SafeItem]:
         """Fetch all items and immediately reduce them to SafeItem.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import asdict
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from . import apply as mover
 from . import categories as cat
 from . import classify as clf
 from . import db
@@ -571,6 +573,207 @@ def review(
             return
         _print_summary(conn, account_id)
         console.print("Use --folder NAME to list items, --export plan.csv to edit in Excel.")
+    finally:
+        conn.close()
+
+
+def _refresh(bw: BwClient, conn, st: dict) -> tuple[str, list[dict], list[SafeItem], db.SyncReport]:
+    """bw sync + sanitized read + merge into the DB, so the plan matches the vault right now."""
+    account_id = st["userId"]
+    with console.status("bw sync and reading the vault..."):
+        bw.sync()
+        folders = bw.list_folders()
+        items = bw.list_safe_items()
+    db.ensure_account(conn, account_id, st.get("serverUrl") or DEFAULT_SERVER)
+    rep = db.sync_snapshot(conn, account_id, items, folders)
+    return account_id, folders, items, rep
+
+
+def _progress(label: str) -> Progress:
+    return Progress(TextColumn(f"[bold]{label}"), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn(), console=console)
+
+
+@app.command("apply")
+def apply_cmd(
+    apply: bool = typer.Option(False, "--apply", help="Actually move items. Without it: dry run."),
+    limit: int | None = typer.Option(None, help="Move at most N items (start with 2 and check them in Bitwarden)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+    skip_backup: bool = typer.Option(False, "--skip-backup", help="Do not create an encrypted export first (not recommended)."),
+    delete_old_folders: bool = typer.Option(False, "--delete-old-folders", help="Afterwards, delete old folders that are now empty."),
+) -> None:
+    """Stage 5: move planned items into their folders. Changes the vault."""
+    s = _settings()
+    try:
+        bw = BwClient(s.bw_session, s.bw_bin)
+        st = _require_unlocked(bw)
+    except BwError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+
+    conn = _open_db(s)
+    try:
+        try:
+            account_id, folders, items, sync_rep = _refresh(bw, conn, st)
+        except BwError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(1)
+        if sync_rep.pending.get("new"):
+            console.print(f"[yellow]{sync_rep.pending['new']} items are not classified yet and will be skipped (run `bwsort classify`).[/]")
+        if sync_rep.became_manual:
+            console.print(f"{sync_rep.became_manual} items you moved yourself since the last run are left alone.")
+
+        folder_map = db.bwsort_folder_map(conn, account_id)
+        live_ids = {f["id"] for f in folders}
+        folder_map = {name: fid for name, fid in folder_map.items() if fid in live_ids}
+        rows = db.items_with_status(conn, account_id, "planned", "failed")
+        missing = sorted({r["category"] for r in rows if r["category"] not in folder_map})
+        if missing:
+            console.print(f"[red]No Bitwarden folder for: {', '.join(missing)}.[/] Run `bwsort create-folders --apply` first.")
+            raise typer.Exit(1)
+        if limit:
+            rows = rows[:limit]
+
+        if rows:
+            per_folder = Counter(r["category"] for r in rows)
+            in_place = sum(1 for r in rows if r["current_folder_id"] == folder_map[r["category"]])
+            t = Table(title="Planned moves" + ("" if apply else " (dry run)"))
+            t.add_column("Folder")
+            t.add_column("Items", justify="right")
+            for name, n in per_folder.most_common():
+                t.add_row(name, str(n))
+            console.print(t)
+            sample = Table(title="Sample")
+            for col in ("Item", "From", "To"):
+                sample.add_column(col)
+            for r in rows[:10]:
+                sample.add_row(r["name"], r["current_folder_name"] or "No folder", r["category"])
+            console.print(sample)
+            console.print(f"{len(rows)} items: {len(rows) - in_place} to move, {in_place} already in place.")
+        else:
+            console.print("Nothing to move.")
+
+        if not apply:
+            console.print("Dry run, nothing changed. Re-run with [bold]--apply[/] (tip: first with [bold]--limit 2[/]).")
+            return
+
+        if rows:
+            if not yes and not typer.confirm(f"Move {len(rows)} items in your Bitwarden vault?"):
+                raise typer.Exit(1)
+            if skip_backup:
+                console.print("[yellow]Skipping the backup as requested.[/]")
+            else:
+                backup = s.data_dir / "backups" / f"bitwarden_export_{datetime.now():%Y%m%d_%H%M%S}.json"
+                console.print(f"Creating an encrypted backup (bw may ask for your master password): {backup}")
+                try:
+                    bw.export_encrypted(backup)
+                    console.print()  # bw prints "Saved ..." without a trailing newline
+                    head = json.loads(backup.read_text(encoding="utf-8"))
+                    if not head.get("encrypted"):
+                        raise BwError("export is not encrypted")
+                    del head
+                except (BwError, OSError, ValueError) as exc:
+                    console.print(f"[red]Backup failed: {exc}. Nothing was moved.[/]")
+                    raise typer.Exit(1)
+                console.print(f"[green]Backup OK[/] ({backup.stat().st_size // 1024} KB, encrypted with your account key).")
+
+            run_id = db.start_run(conn, account_id, "apply")
+            try:
+                with _progress("Moving") as progress:
+                    task = progress.add_task("move", total=len(rows))
+                    rep = mover.apply_plan(
+                        conn, bw, account_id, run_id, rows, folder_map, on_item=lambda: progress.advance(task)
+                    )
+            except KeyboardInterrupt:
+                db.finish_run(conn, run_id, {"interrupted": True})
+                console.print("[yellow]Interrupted. Every finished item is recorded; run `bwsort apply --apply` again to continue.[/]")
+                raise typer.Exit(130)
+            db.finish_run(conn, run_id, {"moved": rep.moved, "already": rep.already_in_place, "failed": rep.failed})
+            console.print(f"[green]Moved {rep.moved}[/], already in place {rep.already_in_place}, failed {rep.failed}.  (run #{run_id})")
+            for e in rep.errors[:10]:
+                console.print(f"[yellow]{e}[/]")
+            if rep.notes:
+                console.print(f"{len(rep.notes)} harmless format differences accepted (no data change):")
+                for n in rep.notes[:10]:
+                    console.print(f"  [dim]{n}[/]")
+            if rep.stopped:
+                console.print(f"[red]Stopped: {rep.stopped}[/]")
+                console.print(
+                    "Check that item in Bitwarden. If something is missing, restore it from the backup in data/backups. "
+                    "Nothing else was changed after it."
+                )
+                raise typer.Exit(1)
+            if rep.failed:
+                console.print("Failed items stay in the plan; run `bwsort apply --apply` again to retry.")
+
+        if delete_old_folders:
+            _delete_old_folders(bw, conn, account_id, yes)
+        console.print("\nWhen you are done: [bold]bw lock[/] and clear BW_SESSION in .env.")
+    finally:
+        conn.close()
+
+
+def _delete_old_folders(bw: BwClient, conn, account_id: str, yes: bool) -> None:
+    with console.status("Re-reading the vault..."):
+        bw.sync()
+        folders = bw.list_folders()
+        items = bw.list_safe_items()
+    empty = mover.empty_old_folders(conn, account_id, folders, items)
+    if not empty:
+        console.print("No empty old folders to delete.")
+        return
+    console.print("Empty old folders: " + ", ".join(f["name"] for f in empty))
+    if not yes and not typer.confirm(f"Delete these {len(empty)} empty folders?"):
+        return
+    for f in empty:
+        try:
+            bw.delete_folder(f["id"])
+            console.print(f"  deleted {f['name']}")
+        except BwError as exc:
+            console.print(f"  [red]{f['name']}: {exc}[/]")
+
+
+@app.command()
+def rollback(
+    run: int | None = typer.Option(None, help="Run number to undo (default: the last `apply` run that moved items)."),
+    apply: bool = typer.Option(False, "--apply", help="Actually move items back. Without it: dry run."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Do not ask for confirmation."),
+) -> None:
+    """Stage 6: move the items of one `apply` run back to their previous folders."""
+    s = _settings()
+    try:
+        bw = BwClient(s.bw_session, s.bw_bin)
+        st = _require_unlocked(bw)
+    except BwError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    conn = _open_db(s)
+    try:
+        account_id, folders, _, _ = _refresh(bw, conn, st)
+        run = run or db.last_run_with_moves(conn, account_id)
+        if not run:
+            console.print("No `apply` run with moves found.")
+            return
+        n = conn.execute("SELECT COUNT(*) FROM moves WHERE account_id=? AND run_id=?", (account_id, run)).fetchone()[0]
+        console.print(f"Run #{run}: {n} moves to undo (items you changed since then are skipped).")
+        if not apply:
+            console.print("Dry run. Re-run with [bold]--apply[/].")
+            return
+        if not yes and not typer.confirm(f"Move up to {n} items back?"):
+            raise typer.Exit(1)
+        new_run = db.start_run(conn, account_id, f"rollback {run}")
+        with _progress("Restoring") as progress:
+            task = progress.add_task("rollback", total=n)
+            rep = mover.rollback_run(
+                conn, bw, account_id, run, new_run, {f["id"] for f in folders}, on_item=lambda: progress.advance(task)
+            )
+        db.finish_run(conn, new_run, {"restored": rep.restored, "skipped": rep.skipped, "failed": rep.failed})
+        console.print(f"[green]Restored {rep.restored}[/], skipped {rep.skipped}, failed {rep.failed}.")
+        for note in rep.notes[:15]:
+            console.print(f"  {note}")
+        if rep.stopped:
+            console.print(f"[red]Stopped: {rep.stopped}[/]")
+            raise typer.Exit(1)
+        console.print("Restored items are `planned` again: fix the plan with `bwsort review` and re-run `bwsort apply`.")
     finally:
         conn.close()
 
