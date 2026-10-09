@@ -1,0 +1,11 @@
+# secrets and vault metadata
+.env
+data/
+*.json.bak
+bitwarden_export_*
+
+# python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

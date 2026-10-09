@@ -1,0 +1,41 @@
+# bwsort
+
+Sorts Bitwarden items into folders using a local Ollama model. Passwords never reach the model. Re-runs only process items added since the last run. Details: [SPEC.md](SPEC.md).
+
+## Quick start (Windows, PowerShell)
+
+```powershell
+cd C:\Users\konst\Desktop\projects\bitwarden_sort
+
+# 1. Once: Bitwarden CLI and login
+winget install Bitwarden.CLI
+bw login
+
+# 2. Config
+Copy-Item .env.example .env
+
+# 3. Unlock. Option A, nothing written to disk (recommended):
+$env:BW_SESSION = bw unlock --raw
+#    Option B: paste the output of `bw unlock --raw` into the BW_SESSION= line in .env
+
+# 4. Dependencies and tests
+uv sync
+uv run pytest -q
+
+# 5. Read-only stages
+uv run bwsort check
+uv run bwsort snapshot
+uv run bwsort status
+
+# 6. Categories (stage 2)
+uv run bwsort categories            # LLM proposal -> data/categories.yaml
+notepad data\categories.yaml        # edit the list
+uv run bwsort categories --import   # store it
+uv run bwsort create-folders        # dry run
+uv run bwsort create-folders --apply
+
+# When finished
+bw lock
+```
+
+State lives in `data/bwsort.db` (SQLite, metadata only). Delete the `data/` folder to start from scratch.
